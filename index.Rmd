@@ -1,0 +1,384 @@
+---
+title: "Mixed effects models with R: An introduction"
+author: "Maxime Blanchard"
+date: "Last updated `r Sys.Date()`"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+options(htmltools.dir.version = FALSE)
+knitr::opts_chunk$set(
+    echo = TRUE, warning = TRUE, message = TRUE, eval = TRUE,
+    fig.width = 7.5, fig.height = 4, fig.retina = 3,
+    out.width = "75%"
+)
+```
+
+This tutorial is a shortened version of a workshop I gave in February 2023. It focuses mostly on how to fit mixed effects models with R, assuming a prior knowledge of what mixed effects models are. For more technical details, please see the slides for the workshop, which can be found [**here**](https://blanchard28.github.io/mixed_effects_workshop/#1).
+
+Let's start by loading the packages we will be using throughout this tutorial:
+
+```{r}
+if (!require("pacman")) install.packages("pacman")
+pacman::p_load(
+               tidyverse,       # for data wrangling
+               lme4,            # to fit mixed effects models
+               marginaleffects, # to visualize model results
+               optimx,          # to try different optimizers
+               broom.mixed      # to easily extract model results
+               )
+```
+
+The most important packages here are `tidyverse`, which allows for easy data wrangling and `lme4`[^1], to fit mixed effects models.
+
+We will be working with data taken from the American National Election Study (ANES), which is a public opinion survey of American voters fielded every presidential election (and periodically in between).[^2] The data is publicly available, but I did some cleaning on the combined dataset - which covers multiple elections - to keep only the few variables we will be using throughout this tutorial. You can download the minimal replication data on the [Github repository](https://github.com/Blanchard28/mixed_effects_workshop) that I created for this project.
+
+Let's load the data and take a quick peak at it:
+
+```{r}
+anes <- readRDS("./data/anes/anes_recoded.rds"); str(anes)
+```
+
+Rows correspond to respondents, while columns correspond to answers to survey questions. The data contain nine variables: `pid`, which is a categorical variable indicating whether the respondent identifies as a Republican, a Democrat or an independent, `age`, which corresponds to the respondent's age, `female`, which is coded 1 if the respondent identifies as a female, 0 otherwise, `race`, which is a categorical variable indicating whether the respondent identifies as black, hispanic, white or other, `ft_dem` and `ft_rep`, which indicate the respondent's feeling thermometer score toward respectively the Democratic and Republican parties (on a 0-97 scale, where higher values indicate warmer feelings), `state`, which is a categorical variable indicating the respondent's state of residence, `year` indicates the year in which the respondent was questioned (always tied to a presidential election in my trimmed-down dataset), and finally `cohort` indicates the decade in which respondents were born.
+
+All of the variables will be used in this tutorial, except `ft_rep`. We will use `ft_dem` as our outcome variable throughout, but I also include `ft_rep` in the dataset to allow you to change the outcome variable and test whether the patterns that we find for feelings toward the Democratic party also apply to the Republican party.
+
+Now, before we start fitting mixed effects models, I present a very quick discussion on clustering which justifies the need to use mixed effects models.
+
+## How to deal with clustering?
+
+Data is often clustered in nature (e.g., respondents nested within cities/provinces/states/countries; students nested within classrooms/schools; repeated observations of the same participants). There are three approaches to treating clustered data: 1) complete pooling (not accounting for clustered nature of data), 2) no pooling (using fixed effects to account for clustering); 3) partial pooling (using random effects to _partially_ account for clustering).
+
+The complete pooling approach has fallen out of favour over the last decades because of its vulnerability to cluster-specific heterogeneity. It assumes that clustering can be ignored, which is generally only realistic when clusters are very specific (e.g., primary sampling units/cities/counties in surveys). Otherwise, if clustering should not be ignored, the complete pooling approach yields biased estimates given its vulnerability to unobserved, cluster-specific confounders.
+
+On the opposite end of the spectrum, you can use a no pooling approach, which fully accounts for cluster-specific heterogeneity. It assumes that unobserved factors that vary across clusters cannot be ignored and accounts for unit-specific unobserved confounders. It allows to make robust inference about the clusters in the sample, but that comes at the cost of not being able to extrapolate beyond the sample. Using fixed effects, our model tends to perform poorly when engaging in out-of-sample predictions.
+
+Fortunately, there's a middle ground between these two approaches, i.e., _partial_ pooling. It assumes that unobserved confounders that vary across clusters cannot be ignored, but puts a probability distribution on inter-cluster variance. Doing so allows us to make inference about the population of clusters when working with only a sample of them. It also allows us to make more credible inference about the sample of clusters when working with imbalanced designs (uneven number of observations across clusters). The general objective of partial pooling is to allow extrapolation beyond the sample, or provide better in-sample predictions when clusters are imbalanced. This latter approach is the focus of this tutorial.
+
+## Estimating a random intercept model
+
+Let's specify a simple random intercept model with state as the clustering variable, using `lme4`. The logic is highly similar to that of `lm()`, with the main difference being the inclusion of our random effects term within parentheses. Inside the parentheses, we need to first specify the parameters that vary, then after `|` we specify the variable which corresponds to our clustering unit. In our case, we specify `1 | state` because we want the intercept to vary by state. Importantly, the clustering variable must **not** be included as a fixed effect parameter.
+
+```{r}
+ri.fit <- lmer(ft_dem ~ 1 + age + female + race +
+                 (1 | state),
+             data = anes)
+summary(ri.fit, 
+        correlation = FALSE) # correlation of FE, of little interest
+```
+
+The `Random effects` part of the output is what's specific to mixed effects models. It provides information on the variance of each random effect we specify, along with the residual variance at the unit-level (i.e. the error term). Remember that random effects are assumed to follow a normal distribution, so the variance parameter gives us useful information on the shape of their distribution. What this is telling us here is that there is some residual variance at the state-level, but it is of very small magnitude compared to the residual variance at the unit-level. In other words, one's feeling toward the Democratic party has much more to do with their individual characteristics rather than the state they live in, which is intuitive.
+
+The most careful observers will notice in the previous output that we are not given any $p$-values. There is a good reason for that. Mixed effects models are a currently evolving line of research and statisticians suggest that the math does not always work out for $p$-values of fixed effects parameters in mixed effects models. Simply put, with unbalanced data, the $t$-value of coefficients does not follow a $t$-distribution. This mostly impacts models that are either complex or have small sample sizes/number of clusters. For relatively simple models with a large sample size and number of clusters, the approximation difference vanishes.
+
+Fortunately, there is a solution if you insist on having $p$-values. The package `lmerTest` allows you to obtain them, but based on what I just mentioned, they are somewhat too optimistic (by how much though will depend on your data and model). If you want my two cents, I think - along with the American Statistical Association and the editorial board of _The American Statistician_ - that **we shouldn't adhere to strict cut-off values of statistical significance anyways**.[^3] So compute confidence intervals around your coefficients of interest as you usually would, and if they almost overlap 0, then you may want to be a bit more conservative in your interpretation than you typically are. Whether we like it or not, data science is still more of an art than a science sometimes.
+
+So, to obtain $p$-values, we simply need to load `lmerTest` and re-fit our model:
+
+```{r}
+pacman::p_load(lmerTest)
+
+ri.fit <- lmer(ft_dem ~ 1 + age + female + race +
+                 (1 | state),
+             data = anes)
+
+summary(ri.fit, 
+        correlation = FALSE)
+```
+
+From here onward we will always have $p$-values included in our `summary()` outputs since we loaded the `lmerTest` package.
+
+### Visualizing random effects
+
+We can extract random effects using `ranef()`. Here, I specify `drop = TRUE` because I want to have the random effects as a vector rather than a list, and I ask `ranef()` not to give me their conditional variance.
+
+```{r}
+ranef(ri.fit, 
+      drop = TRUE,     # to have them as a vector
+      condVar = FALSE) # I don't want to see their conditional variance
+```
+
+To make the visualization more interesting, we can also use a plot. Using the `tidy()` function from the `broom.mixed` package allows us to extract model results as a tibble, which is convenient to work with, among other reasons because we can use it in `ggplot`:
+
+```{r, fig.width = 7.5, fig.height = 6}
+broom.mixed::tidy(ri.fit, 
+                  effects = "ran_vals") %>% # to extract only the random effects
+    ggplot(aes(x = reorder(level, -estimate), y = estimate)) +
+    geom_hline(yintercept = 0, color = "grey70") +
+    geom_point(color = "cyan4") +
+    geom_errorbar(aes(ymin = estimate - 1.96*std.error, ymax = estimate + 1.96*std.error), 
+                  width = 0, color = "cyan4") +
+    labs(x = "State", y = "Random effect") +
+    scale_x_discrete(guide = guide_axis(n.dodge = 2)) +
+    theme_classic() +
+    coord_flip()
+```
+
+An important point to mention about random effects: **do not** interpret their prediction intervals as confidence intervals. Notions of statistical significance are inappropriate here. Since random effects are not fixed parameters, we can't say that we "estimate" them. Thus rather than referring to them as estimates, we commonly refer to them as the **B**est **L**inear **U**nbiased **P**redictors (BLUPs) of the cluster-level variance. Typically, people will just call them "variance components".
+
+## Estimating a crossed random effects model
+
+You can also estimate a model with crossed random effects, i.e., random effects for multiple clusters that are not nested within one another. We will do so estimating a random intercept model on our ANES data where there is a variance component at the state-level and another variance component at the cohort-level (i.e., respondents' decade of birth). These are crossed random effects as respondents from a given state may belong to different cohorts and vice versa.
+
+Importantly, given that we now have two distinct clustering units, we need to also have two sets of parentheses, where we call inside each set of parentheses the variables that vary for each clustering unit. Here, we only have our intercept which varies by state and cohort, but we could theoretically have more than one variable that varies for each cluster. Also, the random effects terms do not have to be the same for each clustering unit, so we could theoretically have the `age` variable varying by state and the `female` variable varying by cohort (along with our intercept in each cluster). The possibilities are endless!
+
+```{r}
+crossed.re.fit <- lmer(ft_dem ~ 1 + age + female + race +
+                           (1 | state) + (1 | cohort),
+                       data = anes)
+summary(crossed.re.fit, 
+        correlation = FALSE)
+```
+
+This time, we see two random effects (intercepts varying by state and also by cohort). The residual variance at the cohort-level is much greater than the variance at the state-level, but this could be deceiving. Given that we have only 13 cohorts, the model is likely to overestimate the cross-cohort variance. Still, the variance at the unit-level remains much greater.
+
+Let's look at our crossed random effects using a plot, similarly to what we did above:
+
+```{r, fig.width = 7.5, fig.height = 4.5}
+bind_rows(
+    predictions(crossed.re.fit, 
+            by = "state") %>% 
+    dplyr::select(state, estimate, conf.low, conf.high) %>% 
+    mutate(re = "State") %>% 
+    rename(value = state),
+    predictions(crossed.re.fit, 
+            by = "cohort") %>% 
+    dplyr::select(cohort, estimate, conf.low, conf.high) %>% 
+    mutate(re = "Cohort") %>% 
+    rename(value = cohort)
+) %>% 
+    ggplot(aes(x = reorder(value, -estimate), y = estimate)) +
+    geom_point(aes(col = re)) +
+    geom_errorbar(aes(ymin = conf.low, ymax = conf.high, col = re),
+                  width = 0) +
+    labs(x = "Random effect", y = "Predicted Democratic FT score") +
+    scale_color_manual("", values = c("cyan4", "royalblue4")) +
+    scale_x_discrete(guide = guide_axis(n.dodge = 2)) +
+    theme_classic() +
+    theme(legend.position = "none") +
+    facet_wrap(. ~ re,
+               scales = "free_y") +
+    coord_flip()
+```
+
+## Estimating a random slope model
+
+Let's come back to our initial random intercept model and add a random slope for age to it, with the slope of age also varying by state.
+
+```{r}
+rs.fit <- lmer(ft_dem ~ 1 + age + female + race +
+                           (1 + age | state),
+               data = anes)
+```
+
+Oooops, we have a scary-looking issue! Convergence issues are relatively frequent when using mixed effects models given the fairly intricate computations that they involve. Fortunately, most of the time there exist relatively simple fixes.
+
+The estimation of mixed effects models can run into some issues when using predictors on vastly different scales. This is exactly our case here as we have two categorical predictors (gender and race) and a continuous predictor (age), with the latter being on a very different scale than the former. This complicates the optimization of our likelihood function as the partial derivative of our continuous predictor (age) will dominate the gradient descent process and either make the algorithm very slow to converge or prevent it from converging altogether. Let's standardize age and see whether that solves the issue.
+
+```{r}
+anes = anes %>%
+    mutate(age.s = (age - mean(age)) / sd(age))
+
+rs.fit <- lmer(ft_dem ~ 1 + age.s + female + race +
+                           (1 + age.s | state),
+               data = anes)
+summary(rs.fit,
+        correlation = FALSE)
+```
+
+This time, the optimizer could evaluate the gradient thanks to our more "workable" distribution of predictors, which shows why you should always scale your predictors before estimating a mixed effects model. In some case though, that could not be enough and the maximum absolute gradient of your model could still be larger than the default tolerance level (.002), i.e., there is still some room for improvement on the model fit before the algorithm stopped. Let's see how we could solve that.
+
+### Trying different optimizers
+
+There exist many optimization algorithms to maximize a function. They all have different internal mechanics, some of them being more robust to complex multivariate functions (i.e., more likely to converge), others being faster. `lme4` can use quite a few. Let's see if different optimizers all allow our model to converge. To do so, we need to use the function `allFit()`:
+
+```{r}
+optims <- allFit(rs.fit,
+                 verbose = FALSE) # don't report progress
+# code below was taken from: https://joshua-nugent.github.io/allFit/
+optims_OK <- optims[sapply(optims, is, "merMod")]
+lapply(optims_OK, function(x) x@optinfo$conv$lme4$messages)
+```
+
+The output above presents us the warning messages that we get when using each optimizer to fit our model. `NULL` means that we have no convergence warning. So in our case, all but the fifth and sixth optimizers provide reliable results.
+
+### Choosing an optimizer
+
+Let's estimate our random intercept, random slope model with an optimizer of our choice. To do so, we need to specify it inside `lmerControl()`:
+
+```{r}
+rs.fit.bob <- lmer(ft_dem ~ 1 + age.s + female + race +
+                       (1 + age.s | state),
+                   control = lmerControl(optimizer = "bobyqa"),
+                   data = anes)
+summary(rs.fit.bob, 
+        correlation = FALSE)
+```
+
+Here, we see two random effects per cluster: a random intercept and a random slope for age. The residual variance for the age slope is much smaller than that for the intercept, but it is expressed on the scale of the fixed effect coefficient, so given the small magnitude of the fixed effect slope for age (.39), a variance of .71 is very meaningful as it implies that some slopes are positive, while others are negative. Important to note: the Corr column, which indicates the correlation of the random effects. Remember that these are assumed to follow a multivariate normal distribution, so this parameter informs us about their estimated covariance.
+
+### Spaghetti plot
+
+We can use what people often call a "spaghetti plot" to visualize our results:
+
+```{r, fig.width = 7, fig.height = 4}
+# creating a dataset to generate predictions
+data.preds = expand.grid(age.s = unique(anes$age.s),
+                         state = unique(anes$state),
+                         female = 1,
+                         race = "hispanic")
+
+# predicting
+data.preds$preds = predict(rs.fit.bob,
+                           newdata = data.preds)
+
+# plotting the predictions
+ggplot(data.preds, aes(x = age.s, y = preds, group = state)) +
+    geom_line(color = "cyan4") +
+    labs(x = "Age (z-score)", y = "Predicted Democratic FT score") +
+    theme_classic() +
+    theme(legend.position = "none")
+```
+
+We see a funnel-like shape because the two random effects are strongly correlated (.86), so the states with the largest intercepts also tend to have the most positive slopes for `age.s` and vice versa. Substantively, the difference in Democratic party FT scores across states appears larger among older voters, compared to younger ones. This could potentially reflect the impact of socialization? Further, as we noticed in the previous slide, some slopes are positive, while others are negative. It is up to you to find such pieces of information and discuss their substantive significance.
+
+### Joint distribution of random effects
+
+When estimating models with many random effects, it can be interesting to investigate their joint distribution. Doing so can sometimes provide valuable substantive insights. `lme4` always assume them to follow a multivariate normal distribution. Bayesian approaches allow you to deviate from that assumption, but this is beyond the scope of this tutorial. Let's look at an example, with the model we just estimated.
+
+```{r, fig.width = 6, fig.height = 5}
+data.frame(ranef(rs.fit.bob)) %>% 
+    dplyr::select(-c(grpvar, condsd)) %>% 
+    pivot_wider(names_from = term, values_from = condval) %>% 
+    rename(state = grp,
+           intercept = `(Intercept)`) %>% 
+    ggplot(aes(x = age.s, y = intercept)) +
+    geom_vline(xintercept = 0, color = "grey70") +
+    geom_hline(yintercept = 0, color = "grey70") +
+    geom_point(color = "cyan4") +
+    labs(x = "RE (age)", y = "RE (intercept)") +
+    theme_classic()
+```
+
+This plot reflects the correlation of the random effects indicated in the `summary()` output. We can see a very strong positive correlation between the two random effects, indicating that clusters with a positive random intercept also tend to have a positive random slope for age, and vice versa for clusters with negative random effects.
+
+### Uncorrelated random effects
+
+By default, `lme4` assumes that random effects follow a multivariate normal distribution, estimates their covariance and uses such information to determine the value of the random effects for each cluster. There's an alternative option, though: uncorrelated random effects. In the latter case, your model does not estimate the covariance of your random effects and they are rather assumed to be distributed as _independent_ normal distributions. If you have reasons to believe that your random effects are independent of one another, this may be worth considering.
+
+Be careful though: if you make the assumption that random effects are independent of one another when in fact they are not, you are discarding useful information, which may lead to less precisely estimated variance components (and poorer out-of-sample predictions)![^4] That said, if you do want to estimate uncorrelated random effects, you simply call the parameters that vary across clustering units in separate sets of parentheses. Here's an example with our model including random effects for the intercept and age:
+
+```{r}
+rs.fit.bob.uncorr <- lmer(ft_dem ~ 1 + age.s + female + race +
+                              (1 | state) + 
+                              (0 + age.s | state), # calling zero to explicitly remove the intercept
+                          control = lmerControl(optimizer = "bobyqa"),
+                          data = anes)
+summary(rs.fit.bob.uncorr, 
+        correlation = FALSE)
+```
+
+As you can see in the random effects part of the output, state is now treated as two distinct clusters (one for the intercept, another for age). We also do not have a correlation parameter for the random effects, which indicates that it was not estimated.
+
+Now let's reproduce our spaghetti plot for our uncorrelated random effects model:
+
+```{r, fig.width = 7, fig.height = 4}
+data.preds$preds.uncorr = predict(rs.fit.bob.uncorr,
+                                  newdata = data.preds)
+
+ggplot(data.preds, aes(x = age.s, y = preds.uncorr, group = state)) +
+    geom_line(color = "cyan4") +
+    labs(x = "Age (z-score)", y = "Predicted Democratic FT score") +
+    theme_classic() +
+    theme(legend.position = "none")
+```
+
+The funnel shape that we saw in our previous model - with correlated random effects - has now disappeared. This is because our two random effects appear not to be correlated anymore.
+
+Let's compare the joint distribution of our random effects in this model with that of our previous model, where random effects were correlated:
+
+```{r}
+
+bind_rows(
+    # correlated REs model
+data.frame(ranef(rs.fit.bob)) %>% 
+    dplyr::select(-c(grpvar, condsd)) %>% 
+    pivot_wider(names_from = term, values_from = condval) %>% 
+    mutate(model = "Correlated REs"),
+# uncorrelated REs model
+data.frame(ranef(rs.fit.bob.uncorr)) %>% 
+    dplyr::select(-c(grpvar, condsd)) %>% 
+    pivot_wider(names_from = term, values_from = condval) %>%
+    mutate(model = "Uncorrelated REs")
+) %>% 
+    rename(state = grp,
+           intercept = `(Intercept)`) %>% 
+    ggplot(aes(x = age.s, y = intercept)) +
+    geom_vline(xintercept = 0, color = "grey70") +
+    geom_hline(yintercept = 0, color = "grey70") +
+    geom_point(color = "cyan4") +
+    labs(x = "RE (age)", y = "RE (intercept)") +
+    theme_classic() +
+    facet_wrap(. ~ model)
+# ggsave("./plots/cover.png", width = 10, height = 4.8)
+```
+
+Looking at our uncorrelated random effects joint distribution (right panel), we kind of see the positive correlation estimated in the previous model (left panel) taking form, but it is much more fuzzy. This is because uncorrelated random effects models cannot identify joint distributions that correspond to tilted ellipses, like we see in the left panel.[^5]
+
+So, how to pick between correlated and uncorrelated random effects? There's unfortunately no hard rule to guide our decision. Part of the choice lies in theoretical considerations: based on your substantive knowledge, does it make sense to assume that your random effects are correlated (i.e., are sampled from a multivariate distribution)? Or is it more likely that they are independent of one another? The other part of the choice is informed by empirics, as we can conduct a likelihood ratio test (LRT) to compare models. Speaking of which...
+
+### Likelihood ratio test
+
+LRTs allow us to test whether the improved fit of our model - when including additional parameters - is "worth" its added complexity (from a statistical point of view). Importantly, an LRT can only test models that are nested within one another. That is, the parameters of the simpler model **must** be a subset of the parameters of the expanded model(s). Further, **all** the parameters of the simpler model must also be included in the expanded model(s). This is what we mean by "models that are nested within one another."
+
+Considering that random effects cannot be interpreted in terms of $p$-values or standard-errors, it is appropriate to use a likelihood ratio test to validate whether their inclusion in a model is statistically warranted. This allows us to test whether the random effects, as a group (and considered as a single parameter), have a variance that is statistically significantly different from zero. The null hypothesis being tested, when comparing a single-level regression with a random intercept model, is that the the variance of the cluster means is equal to zero and thus the random intercepts should not be included in the model:
+
+$$\text{H}_{0}: \sigma^2_{\mu} = 0 \\ \text{H}_{1}: \sigma^2_{\mu} \neq 0$$
+
+A statistically significant result indicates that the added complexity of the more comprehensive model leads to a significant improvement in the model fit (i.e., the improved model accuracy is "worth" the loss of degrees of freedom).
+
+Let's compare our random intercept model to our model including both a random intercept and a random slope. To do so, we need to re-fit our models using maximum likelihood - rather than restricted maximum likelihood, the default estimation criterion in `lme4` - and use the `anova()` function to conduct the LRT:
+
+```{r}
+# re-fit models with ML
+ri.fit.ml <- update(ri.fit, REML = FALSE)
+rs.fit.bob <- update(rs.fit.bob, REML = FALSE)
+
+# conduct LRT
+anova(ri.fit, rs.fit.bob) # put the simpler model first
+```
+
+Given the low $p$-value registered by our test, we can conclude that the results support our use of a more complex model including both random intercepts and slopes.
+
+Remember our discussion of correlated vs uncorrelated random effects? The choice can be guided by empirics, too. Since uncorrelated random effects models do not include a covariance parameter for random effects, they are actually a simpler version of correlated random effects models, which allows us to use an LRT to compare them:
+
+```{r}
+rs.fit.bob <- update(rs.fit.bob, REML = FALSE)
+rs.fit.bob.uncorr <- update(rs.fit.bob.uncorr, REML = FALSE)
+
+anova(rs.fit.bob.uncorr, rs.fit.bob) # put the simpler model first
+```
+
+The results again support our use of a more complex model including a covariance parameter for the random effects. So it appears that our more complex model, with a random intercept, a random slope for age and a correlation parameter for the random effects, provides the best fit.
+
+### Final thoughts
+
+The main limitation I can think of when using `lme4` is its inability to account for autocorrelation, which is a non-negligible issue when using panel data. The alternative package `nlme` allows you to do so.
+
+There are many extensions of mixed effects models that were not covered here. Most importantly, it is possible to include multiple random slopes in a model (be careful not to overfit the data, though). Also, I only focused on models including two levels (units nested within clusters). Random effects model can also accommodate multiple levels of clustering (units nested within clusters that are themselves nested within broader clusters).[^6] But these models are very statistically demanding, you need to have a lot of data to estimate them (again, be careful not to overfit the data). Another important extension is `lme4`'s capacity to accommodate outcome variables following a large variety of distributions, including discrete and count outcome variables. These models are known as generalized linear mixed models (GLMMs) and can also be estimated using `lme4`. Finally, bayesian methods can be useful to further regularize the random effects and speed up computation.
+
+Have fun using mixed effects models and please reach out to me if you have any comments on this tutorial!
+
+## References
+
+[^1]: Bates D., Mächler M., Bolker B. and Walker S. (2015). “Fitting Linear Mixed-Effects Models Using lme4.” _Journal of Statistical Software_, 67(1), 1–48.
+
+[^2]: https://electionstudies.org/.
+
+[^3]: Wasserstein, Ronald L., Allen L. Schirm and Nicole A. Lazar (2019). "Moving to a World Beyond 'p<.05'." _The American Statistician_, 73(sup1): 1-19.
+
+[^4]: For an extended discussion of correlated vs uncorrelated random effects, see https://rpubs.com/yjunechoe/correlationsLMEM.
+
+[^5]: Again, see https://rpubs.com/yjunechoe/correlationsLMEM for more details on this. The author does a very good job to simplify a pretty technical topic.
+
+[^6]: A typical example of that is the case of students (first level) who are nested within classrooms (second level) that are nested within schools (third level).
